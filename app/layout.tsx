@@ -7,6 +7,7 @@ const archivo = Archivo({ subsets: ["latin"], variable: "--font-archivo" });
 export const metadata: Metadata = {
   title: "Are You Really a Fan?",
   description: "Spin the wheel. Prove it. By The Reflective Football.",
+  robots: { index: false, follow: false },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
