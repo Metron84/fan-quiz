@@ -5,6 +5,8 @@ export const MAX_QUESTIONS = 10;
 export const CONTINUE_AFTER = 5;
 export const MAX_CATEGORIES = 8;
 export const GRACE_MS = 2000;
+/** Covers the wheel animation so the player gets the full answer time. */
+export const SPIN_ALLOWANCE_MS = 3000;
 
 export type Phase = "spin" | "question" | "continue" | "finished";
 
@@ -116,7 +118,7 @@ export function applySpin(state: GameState, q: Question, now: number, answerSeco
     phase: "question",
     usedCells: [...state.usedCells, cellKey(q.category, q.value)],
     served: [...state.served, q.id],
-    pending: { questionId: q.id, category: q.category, value: q.value, deadline: now + answerSeconds * 1000 },
+    pending: { questionId: q.id, category: q.category, value: q.value, deadline: now + SPIN_ALLOWANCE_MS + answerSeconds * 1000 },
   };
 }
 

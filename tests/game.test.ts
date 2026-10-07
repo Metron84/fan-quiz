@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   activeCategories, applyAnswer, applyContinue, applySpin, canFinish, canSpin, eligible,
-  newState, pickSpin, summarize, wheel, GRACE_MS, type GameState,
+  newState, pickSpin, summarize, wheel, GRACE_MS, SPIN_ALLOWANCE_MS, type GameState,
 } from "@/lib/server/game";
 import type { Question } from "@/lib/server/questions";
 
@@ -82,10 +82,10 @@ describe("answer", () => {
     const qs = bank(["A"]);
     const q = qs[0];
     const spun = applySpin(newState(qs), q, 0, 45);
-    const late = applyAnswer(qs, spun, (q.acceptedAnswers as string[])[0], 45_000 + GRACE_MS + 1)!;
+    const late = applyAnswer(qs, spun, (q.acceptedAnswers as string[])[0], 45_000 + SPIN_ALLOWANCE_MS + GRACE_MS + 1)!;
     expect(late.timedOut).toBe(true);
     expect(late.correct).toBe(false);
-    const inGrace = applyAnswer(qs, spun, (q.acceptedAnswers as string[])[0], 45_000 + GRACE_MS)!;
+    const inGrace = applyAnswer(qs, spun, (q.acceptedAnswers as string[])[0], 45_000 + SPIN_ALLOWANCE_MS + GRACE_MS)!;
     expect(inGrace.correct).toBe(true);
   });
   it("rejects a replayed answer", () => {
