@@ -1,0 +1,1013 @@
+From a88b704b8fc4524e38b1ffd2f3e3c84b743d2c25 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 13:44:48 +0000
+Subject: [PATCH 1/3] feat(play): add fan_quiz_scores migration, claim function
+ and leaderboard view
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VmiCv9yyyf1pZY6LqwG2w3
+---
+ supabase/migrations/0057_fan_quiz_scores.sql | 147 +++++++++++++++++++
+ 1 file changed, 147 insertions(+)
+ create mode 100644 supabase/migrations/0057_fan_quiz_scores.sql
+
+diff --git a/supabase/migrations/0057_fan_quiz_scores.sql b/supabase/migrations/0057_fan_quiz_scores.sql
+new file mode 100644
+index 0000000..87e5310
+--- /dev/null
++++ b/supabase/migrations/0057_fan_quiz_scores.sql
+@@ -0,0 +1,147 @@
++-- fan_quiz_scores: saved scores from "Are You Really a Fan?" (play.thereflectivefootball.com).
++-- Run after 0056_ultima_action_keys.sql.
++-- NOT YET APPLIED. Melo runs this in the Supabase SQL editor.
++--
++-- The game never writes here. The main site claim route verifies a signed
++-- hand-off token, then calls fan_quiz_claim() with the service role.
++-- One claim per game session (unique session_id). A replay returns the existing row.
++-- One counted entry per account per Dubai day: the first claimed session of the day.
++-- Weeks run Monday 00:00 to Sunday 23:59 Dubai time (Asia/Dubai, UTC+4).
++-- RLS is on and there are no table policies. The public reads the leaderboard view only.
++
++-- ---------------------------------------------------------------------------
++-- 1. Table
++-- ---------------------------------------------------------------------------
++
++create table if not exists public.fan_quiz_scores (
++  id uuid primary key default gen_random_uuid(),
++  user_id uuid not null references auth.users (id) on delete cascade,
++  session_id uuid not null unique,
++  score integer not null,
++  answered integer not null check (answered between 0 and 10),
++  correct integer not null check (correct between 0 and 10),
++  incorrect integer not null check (incorrect between 0 and 10),
++  completed_at timestamptz not null,
++  claimed_at timestamptz not null default now(),
++  play_day date not null,
++  week_start date not null,
++  counted boolean not null default false,
++  check (correct + incorrect = answered)
++);
++
++create unique index if not exists fan_quiz_scores_one_counted_per_day
++  on public.fan_quiz_scores (user_id, play_day)
++  where counted;
++
++create index if not exists fan_quiz_scores_week_idx
++  on public.fan_quiz_scores (week_start)
++  where counted;
++
++alter table public.fan_quiz_scores enable row level security;
++revoke all on table public.fan_quiz_scores from anon, authenticated;
++
++-- ---------------------------------------------------------------------------
++-- 2. Claim (atomic, idempotent per session)
++-- ---------------------------------------------------------------------------
++
++create or replace function public.fan_quiz_claim(
++  p_user uuid,
++  p_session uuid,
++  p_score integer,
++  p_answered integer,
++  p_correct integer,
++  p_incorrect integer,
++  p_completed timestamptz
++)
++returns table (
++  out_score integer,
++  out_answered integer,
++  out_correct integer,
++  out_incorrect integer,
++  out_counted boolean,
++  out_already_claimed boolean,
++  out_user_id uuid
++)
++language plpgsql
++security definer
++set search_path = public
++as $$
++declare
++  v_now timestamptz := now();
++  v_day date := (v_now at time zone 'Asia/Dubai')::date;
++  v_week date := date_trunc('week', v_now at time zone 'Asia/Dubai')::date;
++  v_row public.fan_quiz_scores;
++begin
++  -- Serialise claims per account so "first of the day" cannot be raced.
++  perform pg_advisory_xact_lock(hashtextextended(p_user::text, 0));
++
++  select * into v_row from public.fan_quiz_scores s where s.session_id = p_session;
++  if found then
++    return query select v_row.score, v_row.answered, v_row.correct, v_row.incorrect,
++      v_row.counted, true, v_row.user_id;
++    return;
++  end if;
++
++  insert into public.fan_quiz_scores
++    (user_id, session_id, score, answered, correct, incorrect, completed_at, claimed_at, play_day, week_start, counted)
++  values
++    (p_user, p_session, p_score, p_answered, p_correct, p_incorrect, p_completed, v_now, v_day, v_week,
++     not exists (
++       select 1 from public.fan_quiz_scores s
++       where s.user_id = p_user and s.play_day = v_day and s.counted
++     ))
++  returning * into v_row;
++
++  return query select v_row.score, v_row.answered, v_row.correct, v_row.incorrect,
++    v_row.counted, false, v_row.user_id;
++end;
++$$;
++
++revoke all on function public.fan_quiz_claim(uuid, uuid, integer, integer, integer, integer, timestamptz)
++  from public, anon, authenticated;
++grant execute on function public.fan_quiz_claim(uuid, uuid, integer, integer, integer, integer, timestamptz)
++  to service_role;
++
++-- ---------------------------------------------------------------------------
++-- 3. Public leaderboard view
++-- ---------------------------------------------------------------------------
++-- Best counted score per account per week. Tie-break: more correct, then fewer
++-- questions answered, then earlier completion. Exposes display name, score,
++-- correct, week. No user ids.
++
++create or replace view public.fan_quiz_leaderboard as
++select
++  t.week_start,
++  t.display_name,
++  t.score,
++  t.correct,
++  t.answered,
++  t.completed_at,
++  row_number() over (
++    partition by t.week_start
++    order by t.score desc, t.correct desc, t.answered asc, t.completed_at asc
++  )::integer as rank
++from (
++  select
++    b.week_start,
++    coalesce(nullif(trim(p.preferred_name), ''), 'A fan') as display_name,
++    b.score,
++    b.correct,
++    b.answered,
++    b.completed_at
++  from (
++    select distinct on (s.week_start, s.user_id)
++      s.week_start, s.user_id, s.score, s.correct, s.answered, s.completed_at
++    from public.fan_quiz_scores s
++    where s.counted
++    order by s.week_start, s.user_id, s.score desc, s.correct desc, s.answered asc, s.completed_at asc
++  ) b
++  left join public.profiles p on p.id = b.user_id
++) t;
++
++grant select on public.fan_quiz_leaderboard to anon, authenticated;
++
++-- Verify after running:
++--   select relrowsecurity from pg_class where oid = 'public.fan_quiz_scores'::regclass;   -- true
++--   select count(*) from pg_policies where tablename = 'fan_quiz_scores';                  -- 0
++--   select * from public.fan_quiz_leaderboard limit 1;                                     -- empty is fine
+-- 
+2.43.0
+
+
+From d752f764f52119d68be9fe1849ed8fa449906369 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 13:44:48 +0000
+Subject: [PATCH 2/3] feat(play): verify quiz hand-off tokens and Dubai week
+ windows
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VmiCv9yyyf1pZY6LqwG2w3
+---
+ lib/play/config.js          |  3 ++
+ lib/play/handoff.js         | 78 +++++++++++++++++++++++++++++++++++++
+ lib/play/week.js            | 31 +++++++++++++++
+ package.json                |  1 +
+ tests/play/handoff.test.mjs | 77 ++++++++++++++++++++++++++++++++++++
+ tests/play/week.test.mjs    | 20 ++++++++++
+ 6 files changed, 210 insertions(+)
+ create mode 100644 lib/play/config.js
+ create mode 100644 lib/play/handoff.js
+ create mode 100644 lib/play/week.js
+ create mode 100644 tests/play/handoff.test.mjs
+ create mode 100644 tests/play/week.test.mjs
+
+diff --git a/lib/play/config.js b/lib/play/config.js
+new file mode 100644
+index 0000000..32e6da3
+--- /dev/null
++++ b/lib/play/config.js
+@@ -0,0 +1,3 @@
++/** The quiz lives on its own subdomain. Players are sent back here from /play. */
++export const PLAY_GAME_URL = "https://play.thereflectivefootball.com";
++export const PLAY_TIMEZONE = "Asia/Dubai";
+diff --git a/lib/play/handoff.js b/lib/play/handoff.js
+new file mode 100644
+index 0000000..6d50b1d
+--- /dev/null
++++ b/lib/play/handoff.js
+@@ -0,0 +1,78 @@
++import { createHmac, timingSafeEqual } from "node:crypto";
++
++const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++const MAX_QUESTIONS = 10;
++const MAX_POINTS = MAX_QUESTIONS * 500;
++
++function decodeJson(part) {
++  try {
++    return JSON.parse(Buffer.from(part, "base64url").toString("utf8"));
++  } catch {
++    return null;
++  }
++}
++
++function isInt(n, min, max) {
++  return Number.isInteger(n) && n >= min && n <= max;
++}
++
++/**
++ * Verify an HS256 hand-off token from the quiz game.
++ * Returns { ok: true, claims } or { ok: false, reason } where reason is one of
++ * "missing", "malformed", "signature", "expired", "claims", "unconfigured".
++ * Never throws and never echoes the token or the secret.
++ */
++export function verifyHandoffToken(token, secret, nowMs = Date.now()) {
++  if (!secret) return { ok: false, reason: "unconfigured" };
++  if (typeof token !== "string" || !token) return { ok: false, reason: "missing" };
++  const parts = token.split(".");
++  if (parts.length !== 3 || token.length > 2000) return { ok: false, reason: "malformed" };
++  const [head, body, sig] = parts;
++
++  const header = decodeJson(head);
++  if (!header || header.alg !== "HS256") return { ok: false, reason: "malformed" };
++
++  const expected = createHmac("sha256", secret).update(`${head}.${body}`).digest();
++  let given;
++  try {
++    given = Buffer.from(sig, "base64url");
++  } catch {
++    return { ok: false, reason: "signature" };
++  }
++  if (given.length !== expected.length || !timingSafeEqual(given, expected)) {
++    return { ok: false, reason: "signature" };
++  }
++
++  const c = decodeJson(body);
++  if (!c || typeof c !== "object") return { ok: false, reason: "claims" };
++  if (!isInt(c.exp, 1, Number.MAX_SAFE_INTEGER)) return { ok: false, reason: "claims" };
++  if (c.exp * 1000 <= nowMs) return { ok: false, reason: "expired" };
++
++  const completed = typeof c.completedAt === "string" ? Date.parse(c.completedAt) : NaN;
++  const valid =
++    typeof c.sid === "string" &&
++    UUID.test(c.sid) &&
++    typeof c.nonce === "string" &&
++    c.nonce.length > 0 &&
++    c.nonce.length <= 64 &&
++    isInt(c.score, -MAX_POINTS, MAX_POINTS) &&
++    isInt(c.answered, 0, MAX_QUESTIONS) &&
++    isInt(c.correct, 0, MAX_QUESTIONS) &&
++    isInt(c.incorrect, 0, MAX_QUESTIONS) &&
++    c.correct + c.incorrect === c.answered &&
++    Number.isFinite(completed) &&
++    completed <= nowMs + 5 * 60 * 1000;
++  if (!valid) return { ok: false, reason: "claims" };
++
++  return {
++    ok: true,
++    claims: {
++      sid: c.sid,
++      score: c.score,
++      answered: c.answered,
++      correct: c.correct,
++      incorrect: c.incorrect,
++      completedAt: new Date(completed).toISOString(),
++    },
++  };
++}
+diff --git a/lib/play/week.js b/lib/play/week.js
+new file mode 100644
+index 0000000..120d53c
+--- /dev/null
++++ b/lib/play/week.js
+@@ -0,0 +1,31 @@
++const DUBAI_OFFSET_MS = 4 * 60 * 60 * 1000;
++const DAY_MS = 24 * 60 * 60 * 1000;
++
++const pad = (n) => String(n).padStart(2, "0");
++
++function isoDate(ms) {
++  const d = new Date(ms);
++  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
++}
++
++/** Monday of the Dubai week containing `now`, as YYYY-MM-DD. Weeks run Monday 00:00 to Sunday 23:59 Dubai time. */
++export function dubaiWeekStart(now = new Date()) {
++  const local = now.getTime() + DUBAI_OFFSET_MS;
++  const dow = new Date(local).getUTCDay(); // 0 = Sunday
++  const sinceMonday = (dow + 6) % 7;
++  return isoDate(local - sinceMonday * DAY_MS);
++}
++
++export function lastDubaiWeekStart(now = new Date()) {
++  const [y, m, d] = dubaiWeekStart(now).split("-").map(Number);
++  return isoDate(Date.UTC(y, m - 1, d) - 7 * DAY_MS);
++}
++
++/** "5 Oct to 11 Oct" for a week start. */
++export function weekLabel(weekStart) {
++  const [y, m, d] = weekStart.split("-").map(Number);
++  const start = Date.UTC(y, m - 1, d);
++  const fmt = (ms) =>
++    new Date(ms).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
++  return `${fmt(start)} to ${fmt(start + 6 * DAY_MS)}`;
++}
+diff --git a/package.json b/package.json
+index dfb82af..6e0c281 100644
+--- a/package.json
++++ b/package.json
+@@ -11,6 +11,7 @@
+     "start": "next start",
+     "lint": "eslint",
+     "test:ultima": "node --experimental-test-module-mocks --import ./tests/ultima/helpers/register.mjs --test tests/ultima/*.test.mjs",
++    "test:play": "node --import ./tests/ultima/helpers/register.mjs --test tests/play/*.test.mjs",
+     "test:ultima:sql": "tests/ultima/sql/run.sh",
+     "sync-films": "node scripts/sync-films.mjs",
+     "tag-films": "node scripts/tag-films.mjs",
+diff --git a/tests/play/handoff.test.mjs b/tests/play/handoff.test.mjs
+new file mode 100644
+index 0000000..9e6eccc
+--- /dev/null
++++ b/tests/play/handoff.test.mjs
+@@ -0,0 +1,77 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { createHmac } from "node:crypto";
++import { verifyHandoffToken } from "@/lib/play/handoff.js";
++
++const SECRET = "test-secret";
++const NOW = Date.parse("2026-10-07T12:00:00Z");
++const b64 = (o) => Buffer.from(typeof o === "string" ? o : JSON.stringify(o)).toString("base64url");
++
++function sign(claims, secret = SECRET, header = { alg: "HS256", typ: "JWT" }) {
++  const h = b64(header);
++  const b = b64(claims);
++  const s = createHmac("sha256", secret).update(`${h}.${b}`).digest("base64url");
++  return `${h}.${b}.${s}`;
++}
++
++const claims = (over = {}) => ({
++  sid: "3db872dc-8658-4839-be3e-f149fd13276c",
++  score: 700,
++  answered: 5,
++  correct: 3,
++  incorrect: 2,
++  completedAt: "2026-10-07T11:55:00.000Z",
++  nonce: "abc123",
++  exp: Math.floor(NOW / 1000) + 600,
++  ...over,
++});
++
++test("accepts a valid token", () => {
++  const r = verifyHandoffToken(sign(claims()), SECRET, NOW);
++  assert.equal(r.ok, true);
++  assert.equal(r.claims.score, 700);
++  assert.equal(r.claims.sid, "3db872dc-8658-4839-be3e-f149fd13276c");
++});
++
++test("accepts a negative score", () => {
++  assert.equal(verifyHandoffToken(sign(claims({ score: -300 })), SECRET, NOW).ok, true);
++});
++
++test("rejects a wrong secret and a tampered body", () => {
++  assert.equal(verifyHandoffToken(sign(claims(), "other"), SECRET, NOW).reason, "signature");
++  const [h, , s] = sign(claims()).split(".");
++  const forged = `${h}.${b64(claims({ score: 5000 }))}.${s}`;
++  assert.equal(verifyHandoffToken(forged, SECRET, NOW).reason, "signature");
++});
++
++test("rejects expired tokens", () => {
++  const t = sign(claims({ exp: Math.floor(NOW / 1000) - 1 }));
++  assert.equal(verifyHandoffToken(t, SECRET, NOW).reason, "expired");
++});
++
++test("rejects alg none and other algorithms", () => {
++  assert.equal(verifyHandoffToken(`${b64({ alg: "none" })}.${b64(claims())}.`, SECRET, NOW).ok, false);
++  assert.equal(verifyHandoffToken(sign(claims(), SECRET, { alg: "HS512" }), SECRET, NOW).reason, "malformed");
++});
++
++test("rejects missing, malformed and unconfigured", () => {
++  assert.equal(verifyHandoffToken("", SECRET, NOW).reason, "missing");
++  assert.equal(verifyHandoffToken(undefined, SECRET, NOW).reason, "missing");
++  assert.equal(verifyHandoffToken("a.b", SECRET, NOW).reason, "malformed");
++  assert.equal(verifyHandoffToken(sign(claims()), "", NOW).reason, "unconfigured");
++});
++
++test("rejects bad claims", () => {
++  for (const over of [
++    { sid: "not-a-uuid" },
++    { answered: 11, correct: 6, incorrect: 5 },
++    { correct: 4 },
++    { score: 5001 },
++    { score: 1.5 },
++    { nonce: "" },
++    { completedAt: "nope" },
++    { completedAt: "2026-10-08T12:00:00.000Z" },
++  ]) {
++    assert.equal(verifyHandoffToken(sign(claims(over)), SECRET, NOW).reason, "claims", JSON.stringify(over));
++  }
++});
+diff --git a/tests/play/week.test.mjs b/tests/play/week.test.mjs
+new file mode 100644
+index 0000000..66c5fda
+--- /dev/null
++++ b/tests/play/week.test.mjs
+@@ -0,0 +1,20 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { dubaiWeekStart, lastDubaiWeekStart, weekLabel } from "@/lib/play/week.js";
++
++test("week starts on Monday in Dubai time", () => {
++  // Wed 7 Oct 2026 12:00 UTC
++  assert.equal(dubaiWeekStart(new Date("2026-10-07T12:00:00Z")), "2026-10-05");
++  assert.equal(lastDubaiWeekStart(new Date("2026-10-07T12:00:00Z")), "2026-09-28");
++});
++
++test("Sunday 23:59 Dubai is still the old week, Monday 00:00 Dubai starts the new one", () => {
++  // Sun 11 Oct 23:59 Dubai = 19:59 UTC
++  assert.equal(dubaiWeekStart(new Date("2026-10-11T19:59:00Z")), "2026-10-05");
++  // Mon 12 Oct 00:00 Dubai = Sun 20:00 UTC
++  assert.equal(dubaiWeekStart(new Date("2026-10-11T20:00:00Z")), "2026-10-12");
++});
++
++test("labels a week", () => {
++  assert.equal(weekLabel("2026-10-05"), "5 Oct to 11 Oct");
++});
+-- 
+2.43.0
+
+
+From 91b3448145ffdeae8ce0b1470e6ab09fc2ec2e5b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 13:44:49 +0000
+Subject: [PATCH 3/3] feat(play): claim route, claim page and weekly
+ leaderboard
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VmiCv9yyyf1pZY6LqwG2w3
+---
+ app/api/play/claim/route.js            |  74 ++++++++++++++
+ app/play/claim/page.js                 |  62 ++++++++++++
+ app/play/page.js                       |  84 ++++++++++++++++
+ app/play/page.module.css               | 129 +++++++++++++++++++++++++
+ components/play/ClaimRunner.js         |  69 +++++++++++++
+ components/play/ClaimRunner.module.css |  74 ++++++++++++++
+ env.example                            |   3 +
+ 7 files changed, 495 insertions(+)
+ create mode 100644 app/api/play/claim/route.js
+ create mode 100644 app/play/claim/page.js
+ create mode 100644 app/play/page.js
+ create mode 100644 app/play/page.module.css
+ create mode 100644 components/play/ClaimRunner.js
+ create mode 100644 components/play/ClaimRunner.module.css
+
+diff --git a/app/api/play/claim/route.js b/app/api/play/claim/route.js
+new file mode 100644
+index 0000000..8255ca1
+--- /dev/null
++++ b/app/api/play/claim/route.js
+@@ -0,0 +1,74 @@
++import { NextResponse } from "next/server";
++import { createClient } from "@/lib/supabase/server";
++import { getServiceClient } from "@/lib/supabase";
++import { verifyHandoffToken } from "@/lib/play/handoff";
++
++export const dynamic = "force-dynamic";
++
++const MESSAGES = {
++  unconfigured: "Saving scores is not available right now. Try again soon.",
++  missing: "That link is missing its score. Play again to get a new one.",
++  malformed: "That link did not work. Play again to get a new one.",
++  signature: "That link did not work. Play again to get a new one.",
++  claims: "That link did not work. Play again to get a new one.",
++  expired: "That link has expired. Play again to get a fresh one.",
++};
++
++export async function POST(request) {
++  const supabase = await createClient();
++  const service = getServiceClient();
++  if (!supabase || !service) {
++    return NextResponse.json({ message: "Not configured." }, { status: 503 });
++  }
++
++  const {
++    data: { user },
++  } = await supabase.auth.getUser();
++  if (!user) {
++    return NextResponse.json({ message: "Sign in to save your score.", reason: "auth" }, { status: 401 });
++  }
++
++  let body;
++  try {
++    body = await request.json();
++  } catch {
++    return NextResponse.json({ message: MESSAGES.malformed, reason: "malformed" }, { status: 400 });
++  }
++
++  const check = verifyHandoffToken(body?.token, process.env.PLAY_HANDOFF_SECRET);
++  if (!check.ok) {
++    const status = check.reason === "unconfigured" ? 503 : 400;
++    return NextResponse.json({ message: MESSAGES[check.reason], reason: check.reason }, { status });
++  }
++  const c = check.claims;
++
++  const { data, error } = await service.rpc("fan_quiz_claim", {
++    p_user: user.id,
++    p_session: c.sid,
++    p_score: c.score,
++    p_answered: c.answered,
++    p_correct: c.correct,
++    p_incorrect: c.incorrect,
++    p_completed: c.completedAt,
++  });
++  const row = Array.isArray(data) ? data[0] : data;
++  if (error || !row) {
++    return NextResponse.json({ message: "Could not save your score. Try again." }, { status: 500 });
++  }
++  if (row.out_user_id !== user.id) {
++    return NextResponse.json(
++      { message: "That score is already saved to another account.", reason: "taken" },
++      { status: 409 }
++    );
++  }
++
++  return NextResponse.json({
++    ok: true,
++    score: row.out_score,
++    answered: row.out_answered,
++    correct: row.out_correct,
++    incorrect: row.out_incorrect,
++    counted: row.out_counted,
++    alreadyClaimed: row.out_already_claimed,
++  });
++}
+diff --git a/app/play/claim/page.js b/app/play/claim/page.js
+new file mode 100644
+index 0000000..e77bcb5
+--- /dev/null
++++ b/app/play/claim/page.js
+@@ -0,0 +1,62 @@
++import Link from "next/link";
++import { redirect } from "next/navigation";
++import Breadcrumb from "@/components/Breadcrumb";
++import SectionHeader from "@/components/SectionHeader";
++import ClaimRunner from "@/components/play/ClaimRunner";
++import { getSessionUser } from "@/lib/auth/session";
++import { PLAY_GAME_URL } from "@/lib/play/config";
++import { verifyHandoffToken } from "@/lib/play/handoff";
++import styles from "../page.module.css";
++
++export const metadata = {
++  title: "Save your score",
++  robots: { index: false },
++};
++
++export const dynamic = "force-dynamic";
++
++const PROBLEMS = {
++  unconfigured: "Saving scores is not available right now. Try again soon.",
++  expired: "That link has expired. Play again to get a fresh one.",
++  missing: "That link is missing its score. Play again to get a new one.",
++  default: "That link did not work. Play again to get a new one.",
++};
++
++export default async function ClaimPage({ searchParams }) {
++  const params = await searchParams;
++  const token = typeof params?.t === "string" ? params.t : "";
++  const check = verifyHandoffToken(token, process.env.PLAY_HANDOFF_SECRET);
++
++  if (!check.ok) {
++    return (
++      <div className={styles.page}>
++        <Breadcrumb items={[{ label: "Home", href: "/" }, { label: "Play", href: "/play" }, { label: "Save score" }]} />
++        <div className={styles.inner}>
++          <SectionHeader eyebrow="Are You Really a Fan?" title="Save your score" />
++          <p className={styles.note}>{PROBLEMS[check.reason] ?? PROBLEMS.default}</p>
++          <div className={styles.actions}>
++            <a href={PLAY_GAME_URL} className={styles.primary}>Back to the game</a>
++            <Link href="/play" className={styles.secondary}>See the leaderboard</Link>
++            <Link href="/films" className={styles.secondary}>Watch the films</Link>
++          </div>
++        </div>
++      </div>
++    );
++  }
++
++  // Signed out: through the existing sign-in wall, then straight back to this URL.
++  const user = await getSessionUser();
++  if (!user) {
++    redirect(`/signin?next=${encodeURIComponent(`/play/claim?t=${token}`)}`);
++  }
++
++  return (
++    <div className={styles.page}>
++      <Breadcrumb items={[{ label: "Home", href: "/" }, { label: "Play", href: "/play" }, { label: "Save score" }]} />
++      <div className={styles.inner}>
++        <SectionHeader eyebrow="Are You Really a Fan?" title="Save your score" />
++        <ClaimRunner token={token} />
++      </div>
++    </div>
++  );
++}
+diff --git a/app/play/page.js b/app/play/page.js
+new file mode 100644
+index 0000000..f3f1da6
+--- /dev/null
++++ b/app/play/page.js
+@@ -0,0 +1,84 @@
++import Link from "next/link";
++import Breadcrumb from "@/components/Breadcrumb";
++import SectionHeader from "@/components/SectionHeader";
++import { getRenderClient } from "@/lib/supabase/server";
++import { PLAY_GAME_URL } from "@/lib/play/config";
++import { dubaiWeekStart, lastDubaiWeekStart, weekLabel } from "@/lib/play/week";
++import styles from "./page.module.css";
++
++export const metadata = {
++  title: "Are You Really a Fan?",
++  description: "Spin the wheel, answer the clue, and see this week's leaderboard.",
++  alternates: { canonical: "/play" },
++};
++
++export const dynamic = "force-dynamic";
++
++const LIMIT = 20;
++
++async function loadWeek(supabase, weekStart) {
++  if (!supabase) return [];
++  const { data } = await supabase
++    .from("fan_quiz_leaderboard")
++    .select("rank, display_name, score, correct, answered")
++    .eq("week_start", weekStart)
++    .order("rank", { ascending: true })
++    .limit(LIMIT);
++  return data ?? [];
++}
++
++function Board({ title, weekStart, rows, emptyHint }) {
++  return (
++    <section className={styles.board} aria-label={title}>
++      <h2 className={styles.boardTitle}>
++        {title} <span className={styles.boardDates}>{weekLabel(weekStart)}</span>
++      </h2>
++      {rows.length ? (
++        <ol className={styles.rows}>
++          {rows.map((r) => (
++            <li key={`${r.rank}-${r.display_name}`} className={styles.row}>
++              <span className={styles.rank}>{r.rank}</span>
++              <span className={styles.name}>{r.display_name}</span>
++              <span className={styles.meta}>{r.correct} correct</span>
++              <span className={styles.score}>{r.score}</span>
++            </li>
++          ))}
++        </ol>
++      ) : (
++        <p className={styles.empty}>{emptyHint}</p>
++      )}
++    </section>
++  );
++}
++
++export default async function PlayPage() {
++  const supabase = await getRenderClient();
++  const now = new Date();
++  const thisWeek = dubaiWeekStart(now);
++  const lastWeek = lastDubaiWeekStart(now);
++  const [current, previous] = await Promise.all([
++    loadWeek(supabase, thisWeek),
++    loadWeek(supabase, lastWeek),
++  ]);
++
++  return (
++    <div className={styles.page}>
++      <Breadcrumb items={[{ label: "Home", href: "/" }, { label: "Play" }]} />
++      <div className={styles.inner}>
++        <SectionHeader
++          eyebrow="Are You Really a Fan?"
++          title="This week's leaderboard"
++          context="Spin the wheel. Answer the clue. Your first saved score each day counts."
++        />
++        <div className={styles.actions}>
++          <a href={PLAY_GAME_URL} className={styles.primary}>Play now</a>
++          <Link href="/films" className={styles.secondary}>Watch the films</Link>
++          <Link href="/ultima" className={styles.secondary}>Play Ultima</Link>
++        </div>
++        <Board title="This week" weekStart={thisWeek} rows={current} emptyHint="No scores yet. Be the first on the board." />
++        <Board title="Last week" weekStart={lastWeek} rows={previous} emptyHint="No scores from last week." />
++        <p className={styles.note}>Weeks run Monday to Sunday, Dubai time.</p>
++      </div>
++    </div>
++  );
++}
+diff --git a/app/play/page.module.css b/app/play/page.module.css
+new file mode 100644
+index 0000000..1cb61ac
+--- /dev/null
++++ b/app/play/page.module.css
+@@ -0,0 +1,129 @@
++.page {
++  flex: 1;
++}
++
++.inner {
++  margin: 0 auto;
++  max-width: 40rem;
++  padding: 2rem 1rem 3.5rem;
++}
++
++.actions {
++  display: flex;
++  flex-direction: column;
++  gap: 0.75rem;
++  margin: 1.5rem 0 2.25rem;
++}
++
++.primary,
++.secondary {
++  display: block;
++  padding: 0.9rem 1rem;
++  border-radius: 0.5rem;
++  font-family: var(--font-body);
++  font-size: 1rem;
++  font-weight: 700;
++  text-align: center;
++  text-decoration: none;
++}
++
++.primary {
++  background: var(--color-navy);
++  color: var(--color-paper);
++}
++
++.secondary {
++  border: 2px solid var(--color-navy);
++  color: var(--color-navy);
++}
++
++.board {
++  margin-bottom: 2rem;
++}
++
++.boardTitle {
++  margin: 0 0 0.75rem;
++  font-family: var(--font-body);
++  font-size: 0.75rem;
++  font-weight: 700;
++  letter-spacing: 0.24em;
++  text-transform: uppercase;
++  color: var(--color-navy);
++}
++
++.boardDates {
++  margin-left: 0.5rem;
++  font-weight: 500;
++  letter-spacing: 0.08em;
++  color: rgba(10, 17, 31, 0.6);
++}
++
++.rows {
++  list-style: none;
++  margin: 0;
++  padding: 0;
++  border-top: 1px solid rgba(10, 17, 31, 0.18);
++}
++
++.row {
++  display: grid;
++  grid-template-columns: 2rem 1fr auto auto;
++  align-items: baseline;
++  gap: 0.75rem;
++  padding: 0.75rem 0;
++  border-bottom: 1px solid rgba(10, 17, 31, 0.18);
++  font-family: var(--font-body);
++  color: var(--color-navy);
++}
++
++.rank {
++  font-weight: 700;
++  font-variant-numeric: tabular-nums;
++}
++
++.name {
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++  font-weight: 600;
++}
++
++.meta {
++  font-size: 0.8125rem;
++  color: rgba(10, 17, 31, 0.64);
++}
++
++.score {
++  min-width: 3rem;
++  text-align: right;
++  font-size: 1.25rem;
++  font-weight: 800;
++  font-variant-numeric: tabular-nums;
++}
++
++.empty,
++.note {
++  margin: 0;
++  font-family: var(--font-body);
++  font-size: 0.9375rem;
++  line-height: 1.45;
++  color: rgba(10, 17, 31, 0.72);
++}
++
++@media (min-width: 640px) {
++  .inner {
++    padding: 3rem 1.5rem 4rem;
++  }
++
++  .actions {
++    flex-direction: row;
++    flex-wrap: wrap;
++  }
++
++  .primary,
++  .secondary {
++    padding-left: 1.5rem;
++    padding-right: 1.5rem;
++  }
++}
+diff --git a/components/play/ClaimRunner.js b/components/play/ClaimRunner.js
+new file mode 100644
+index 0000000..602df2d
+--- /dev/null
++++ b/components/play/ClaimRunner.js
+@@ -0,0 +1,69 @@
++"use client";
++
++import { useEffect, useRef, useState } from "react";
++import Link from "next/link";
++import { PLAY_GAME_URL } from "@/lib/play/config";
++import styles from "./ClaimRunner.module.css";
++
++export default function ClaimRunner({ token }) {
++  const [state, setState] = useState({ status: "saving" });
++  const started = useRef(false);
++
++  useEffect(() => {
++    if (started.current) return;
++    started.current = true;
++    (async () => {
++      try {
++        const res = await fetch("/api/play/claim", {
++          method: "POST",
++          headers: { "Content-Type": "application/json" },
++          body: JSON.stringify({ token }),
++        });
++        const data = await res.json();
++        if (res.ok) setState({ status: "done", ...data });
++        else setState({ status: "error", message: data.message ?? "Could not save your score." });
++      } catch {
++        setState({ status: "error", message: "No connection. Check your signal and try again." });
++      }
++    })();
++  }, [token]);
++
++  if (state.status === "saving") {
++    return <p className={styles.lead} role="status">Saving your score</p>;
++  }
++
++  if (state.status === "error") {
++    return (
++      <div>
++        <p className={styles.lead}>{state.message}</p>
++        <div className={styles.actions}>
++          <a href={PLAY_GAME_URL} className={styles.primary}>Play again</a>
++          <Link href="/films" className={styles.secondary}>Watch the films</Link>
++        </div>
++      </div>
++    );
++  }
++
++  return (
++    <div>
++      <p className={styles.kicker}>{state.alreadyClaimed ? "Already saved" : "Saved"}</p>
++      <p className={styles.score}>{state.score}</p>
++      <p className={styles.sub}>
++        {state.correct} correct from {state.answered} questions
++      </p>
++      <p className={styles.lead}>
++        {state.alreadyClaimed
++          ? "This score was already on your account."
++          : state.counted
++            ? "This is your counted score for today. It is on the leaderboard."
++            : "Your first score each day is the one that counts. Play again tomorrow for another go."}
++      </p>
++      <div className={styles.actions}>
++        <Link href="/play" className={styles.primary}>See the leaderboard</Link>
++        <a href={PLAY_GAME_URL} className={styles.secondary}>Play again</a>
++        <Link href="/films" className={styles.secondary}>Watch the films</Link>
++        <Link href="/ultima" className={styles.secondary}>Play Ultima</Link>
++      </div>
++    </div>
++  );
++}
+diff --git a/components/play/ClaimRunner.module.css b/components/play/ClaimRunner.module.css
+new file mode 100644
+index 0000000..6cb2a66
+--- /dev/null
++++ b/components/play/ClaimRunner.module.css
+@@ -0,0 +1,74 @@
++.kicker {
++  margin: 0 0 0.5rem;
++  font-family: var(--font-body);
++  font-size: 0.6875rem;
++  font-weight: 600;
++  letter-spacing: 0.28em;
++  text-transform: uppercase;
++  color: rgba(10, 17, 31, 0.6);
++}
++
++.score {
++  margin: 0;
++  font-family: var(--font-body);
++  font-size: 4.5rem;
++  font-weight: 800;
++  line-height: 1;
++  color: var(--color-navy);
++}
++
++.sub {
++  margin: 0.5rem 0 1.25rem;
++  font-family: var(--font-body);
++  font-size: 1rem;
++  color: rgba(10, 17, 31, 0.72);
++}
++
++.lead {
++  margin: 0 0 1.5rem;
++  font-family: var(--font-body);
++  font-size: 1.0625rem;
++  line-height: 1.45;
++  color: var(--color-navy);
++}
++
++.actions {
++  display: flex;
++  flex-direction: column;
++  gap: 0.75rem;
++}
++
++.primary,
++.secondary {
++  display: block;
++  padding: 0.9rem 1rem;
++  border-radius: 0.5rem;
++  font-family: var(--font-body);
++  font-size: 1rem;
++  font-weight: 700;
++  text-align: center;
++  text-decoration: none;
++}
++
++.primary {
++  background: var(--color-navy);
++  color: var(--color-paper);
++}
++
++.secondary {
++  border: 2px solid var(--color-navy);
++  color: var(--color-navy);
++}
++
++@media (min-width: 640px) {
++  .actions {
++    flex-direction: row;
++    flex-wrap: wrap;
++  }
++
++  .primary,
++  .secondary {
++    padding-left: 1.5rem;
++    padding-right: 1.5rem;
++  }
++}
+diff --git a/env.example b/env.example
+index a4e5b23..dd7f015 100644
+--- a/env.example
++++ b/env.example
+@@ -49,3 +49,6 @@ ULTIMA_JOIN_PASSWORD=
+ RESEND_API_KEY=
+ # CONCIERGE_FROM_EMAIL=concierge@thereflectivefootball.com
+ # ULTIMA_FROM_EMAIL=concierge@thereflectivefootball.com
++
++# The Reflective Football quiz hand-off (server only; same value as the quiz project, never commit it)
++PLAY_HANDOFF_SECRET=
+-- 
+2.43.0
+
