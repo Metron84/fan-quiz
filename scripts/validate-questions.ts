@@ -1,2 +1,13 @@
-// Implemented in Phase 2.
-console.log("validate:questions not implemented yet (Phase 2)");
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { validateQuestions } from "../lib/server/validate";
+
+const file = join(process.cwd(), "data", "questions.json");
+const data = JSON.parse(readFileSync(file, "utf8"));
+const issues = validateQuestions(data);
+const errors = issues.filter((i) => i.level === "error");
+const warns = issues.filter((i) => i.level === "warn");
+
+for (const i of issues) console.log(`${i.level.toUpperCase()} ${i.id}: ${i.message}`);
+console.log(`${Array.isArray(data) ? data.length : 0} questions, ${errors.length} errors, ${warns.length} warnings`);
+process.exit(errors.length ? 1 : 0);
