@@ -48,9 +48,9 @@ export async function loadSession(req: NextRequest): Promise<Row | null> {
 }
 
 /** Single update guarded by the version we read. False means another request got there first. */
-export async function saveState(row: Row, state: GameState, completed = false): Promise<boolean> {
+export async function saveState(row: Row, state: GameState, completedAt?: string): Promise<boolean> {
   const patch: Record<string, unknown> = { state, version: row.version + 1 };
-  if (completed) patch.completed_at = new Date().toISOString();
+  if (completedAt) patch.completed_at = completedAt;
   const { data, error } = await db()
     .from("fan_quiz_sessions")
     .update(patch)
